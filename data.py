@@ -68,14 +68,33 @@ def fetch_blockchain_chart(chart_name: str, timespan: str = 'all',
     -------
     DataFrame with DatetimeIndex and one column named `chart_name`.
     """
-    # TODO:
-    # 1. If use_cache and a cached CSV exists, load and return.
-    # 2. Otherwise GET the URL, parse CSV with pd.read_csv(StringIO(...)),
-    #    columns=['date', chart_name], parse_dates=['date'].
-    # 3. Set 'date' as index.
-    # 4. Save to cache if use_cache.
-    # 5. Return.
-    pass
+    # 1. Load from cache if available
+    if use_cache and os.path.exists(CACHE_DIR):
+        df = pd.read_csv(CACHE_DIR, index_col='date', parse_dates=['date'])
+        return df
+
+    # 2. Fetch from the API
+    url = f'{BLOCKCHAIN_API_BASE}/{chart_name}'
+    params = {'timespan': timespan, 'format': 'csv'}
+    response = requests.get(url, params=params, timeout=30)
+    response.raise_for_status()   # raises if the request failed (4xx/5xx)
+
+    # 3. Parse — the CSV has NO header, just timestamp,value rows
+    df = pd.read_csv(
+        StringIO(response.text),
+        header=None,
+        names=['date', chart_name],
+        parse_dates=['date'],
+    )
+    df = df.set_index('date')
+
+    # 4. Save to cache
+    if use_cache:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        df.to_csv(CACHE_DIR)
+
+    # 5. Return
+    return df
 
 
 def fetch_all_blockchain_charts(charts: Optional[dict] = None,
@@ -85,8 +104,21 @@ def fetch_all_blockchain_charts(charts: Optional[dict] = None,
 
     Returns one DataFrame with the friendly column names from BLOCKCHAIN_CHARTS.
     """
-    # TODO: loop fetch_blockchain_chart for each, rename column, outer-join.
-    pass
+    if charts is None:
+        charts = BLOCKCHAIN_CHARTS
+
+    merged = None
+    for chart_name, friendly_name in charts.items():
+        df = fetch_blockchain_chart(chart_name, use_cache=use_cache)
+        df = df.rename(columns={chart_name: friendly_name})
+
+        if merged is None:
+            merged = df
+        else:
+            merged = merged.join(df, how='outer')   # join on the DatetimeIndex
+
+    merged = merged.sort_index()
+    return merged
 
 
 def fetch_yfinance_btc(start: Optional[str] = None,
@@ -96,10 +128,23 @@ def fetch_yfinance_btc(start: Optional[str] = None,
 
     Returns DataFrame with DatetimeIndex and column 'price_usd_yf'.
     """
-    # TODO: yf.download('BTC-USD', start=start, end=end), keep 'Close',
-    # rename to 'price_usd_yf'. Beware: yfinance returns timezone-aware dates;
-    # call .tz_localize(None) on the index to align with blockchain.com.
-    pass
+    raw = yf.download('BTC-USD', start=start, end=end,
+                      auto_adjust=True, progress=False)
+
+    # Recent yfinance versions return MultiIndex columns like ('Close', 'BTC-USD').
+    # Flatten to just the price level if that's the case.
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+
+    # Keep only the closing price, rename it
+    df = raw[['Close']].rename(columns={'Close': 'price_usd_yf'})
+
+    # Drop timezone if present (tz_localize returns a NEW index — must reassign)
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+
+    df.index.name = 'date'
+    return df
 
 
 def compare_price_sources(df_blockchain: pd.DataFrame,
@@ -110,15 +155,40 @@ def compare_price_sources(df_blockchain: pd.DataFrame,
     Returns dict with 'correlation', 'mean_abs_diff', 'rmse', and 'merged'
     (the merged DataFrame, useful for plotting in the notebook).
     """
-    # TODO: inner-merge on date, compute Pearson r, MAE, RMSE.
-    pass
+    # Pull just the price column from the blockchain frame
+    bc = df_blockchain[['price_usd']].rename(columns={'price_usd': 'price_bc'})
+    yf_ = df_yfinance.rename(columns={'price_usd_yf': 'price_yf'})
+
+    # Inner-merge on the date index → only dates present in BOTH sources
+    merged = bc.join(yf_, how='inner').dropna()
+
+    diff = merged['price_bc'] - merged['price_yf']
+
+    # Pearson correlation between the two series
+    correlation = merged['price_bc'].corr(merged['price_yf'])
+
+    # Absolute error metrics (in USD)
+    mean_abs_diff = diff.abs().mean()
+    rmse = np.sqrt((diff ** 2).mean())
+
+    # Relative error (%) — more meaningful given the huge price range
+    mean_abs_pct_diff = (diff.abs() / merged['price_yf']).mean() * 100
+
+    return {
+        'correlation': correlation,
+        'mean_abs_diff': mean_abs_diff,
+        'rmse': rmse,
+        'mean_abs_pct_diff': mean_abs_pct_diff,
+        'n_obs': len(merged),
+        'merged': merged,
+    }
 
 
 # ============================================================================
 # CLEANING & TRANSFORMS
 # ============================================================================
 
-def clean(df: pd.DataFrame, drop_before: Optional[str] = '2011-01-01') -> pd.DataFrame:
+def clean(df: pd.DataFrame, drop_before: Optional[str] = '2011-01-01', ffill_limit: int = 2) -> pd.DataFrame:
     """
     Basic cleaning of the master DataFrame.
 
@@ -126,8 +196,26 @@ def clean(df: pd.DataFrame, drop_before: Optional[str] = '2011-01-01') -> pd.Dat
     - Forward-fill small gaps; drop rows that are still all-NaN.
     - Drop rows where the dependent variable (fees_btc) is zero or missing.
     """
-    # TODO
-    pass
+    df = df.copy()                          # never mutate the caller's frame
+
+    # 1. Drop early sparse data
+    if drop_before is not None:
+        df = df[df.index >= drop_before]
+
+    # 2. Forward-fill SMALL gaps in explanatory variables only.
+    #    `limit=ffill_limit` stops us from carrying a value across a long blackout.
+    #    We deliberately exclude fees_btc — see docstring.
+    explanatory = [c for c in df.columns if c != 'fees_btc']
+    df[explanatory] = df[explanatory].ffill(limit=ffill_limit)
+
+    # 3. Drop rows that are entirely NaN (e.g. dates before any series starts)
+    df = df.dropna(how='all')
+
+    # 4. Drop rows where the dependent variable is missing or zero.
+    #    Zero daily fees only occur in the earliest, near-empty days — not real data.
+    df = df[df['fees_btc'].notna() & (df['fees_btc'] > 0)]
+
+    return df
 
 
 def add_log_transforms(df: pd.DataFrame, cols: list) -> pd.DataFrame:
@@ -136,8 +224,10 @@ def add_log_transforms(df: pd.DataFrame, cols: list) -> pd.DataFrame:
 
     Replaces zeros with NaN before taking the log to avoid -inf.
     """
-    # TODO: df[f'log_{col}'] = np.log(df[col].replace(0, np.nan))
-    pass
+    df = df.copy()
+    for col in cols:
+        df[f'log_{col}'] = np.log(df[col].replace(0, np.nan))
+    return df
 
 
 def add_differences(df: pd.DataFrame, cols: list, periods: int = 1) -> pd.DataFrame:
@@ -146,8 +236,10 @@ def add_differences(df: pd.DataFrame, cols: list, periods: int = 1) -> pd.DataFr
 
     Useful once you've established the levels are non-stationary.
     """
-    # TODO
-    pass
+    df = df.copy()
+    for col in cols:
+        df[f'd_{col}'] = df[col].diff(periods=periods)
+    return df
 
 
 def split_by_halving(df: pd.DataFrame,
@@ -157,13 +249,35 @@ def split_by_halving(df: pd.DataFrame,
 
     Returns dict mapping era label (e.g. 'era_1_pre_2012') to sub-DataFrame.
     """
-    # TODO: use HALVING_DATES as cut points. Returns 5 frames:
-    # era_1: start → 2012-11-28
-    # era_2: 2012-11-28 → 2016-07-09
-    # era_3: 2016-07-09 → 2020-05-11
-    # era_4: 2020-05-11 → 2024-04-19
-    # era_5: 2024-04-19 → end
-    pass
+    if halving_dates is None:
+        halving_dates = HALVING_DATES
+
+    # Build boundary list: [start_of_data, halving_1, ..., halving_n, end_of_data]
+    cuts = [df.index.min()] + [pd.Timestamp(d) for d in halving_dates] + [df.index.max()]
+
+    eras = {}
+    for i in range(len(cuts) - 1):
+        lo, hi = cuts[i], cuts[i + 1]
+
+        # Half-open intervals [lo, hi) so a halving date belongs to the era it opens,
+        # and no row is double-counted at the boundaries.
+        # The final era is closed on the right to include the last day.
+        if i == len(cuts) - 2:
+            mask = (df.index >= lo) & (df.index <= hi)
+        else:
+            mask = (df.index >= lo) & (df.index < hi)
+
+        # Label with the year of the upper halving boundary for readability
+        if i == 0:
+            label = f'era_{i+1}_pre_{halving_dates[0][:4]}'
+        elif i == len(cuts) - 2:
+            label = f'era_{i+1}_post_{halving_dates[-1][:4]}'
+        else:
+            label = f'era_{i+1}_{halving_dates[i-1][:4]}_{halving_dates[i][:4]}'
+
+        eras[label] = df.loc[mask].copy()
+
+    return eras
 
 
 # ============================================================================
@@ -179,4 +293,34 @@ def build_master_dataset(use_cache: bool = True,
     """
     # TODO: fetch_all_blockchain_charts → clean → add_log_transforms
     # → add_differences → optionally merge yfinance → return.
-    pass
+    # 1. Fetch and clean the blockchain.com data
+    df = fetch_all_blockchain_charts(use_cache=use_cache)
+    df = clean(df)
+
+    # 2. Define which level variables get logged + differenced.
+    #    These should be strictly positive series (prices, counts, sizes).
+    level_cols = [
+        'fees_btc',
+        'price_usd',
+        'mempool_bytes',
+        'mempool_count',
+        'n_transactions',
+        'avg_block_size',
+        'hash_rate',
+        'difficulty',
+    ]
+    # Guard against any column not present (e.g. if you fetched a subset)
+    level_cols = [c for c in level_cols if c in df.columns]
+
+    # 3. Add log transforms, then log-differences (≈ log-returns)
+    df = add_log_transforms(df, level_cols)
+    log_cols = [f'log_{c}' for c in level_cols]
+    df = add_differences(df, log_cols)
+
+    # 4. Optionally merge the Yahoo Finance price for the cross-source check
+    if include_yfinance:
+        start = df.index.min().strftime('%Y-%m-%d')
+        yf_df = fetch_yfinance_btc(start=start)
+        df = df.join(yf_df, how='left')   # left join: keep blockchain.com as the spine
+
+    return df
