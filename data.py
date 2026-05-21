@@ -54,48 +54,37 @@ def fetch_blockchain_chart(chart_name: str, timespan: str = 'all',
     Fetch a single chart from blockchain.com's charts API.
 
     URL pattern: {BLOCKCHAIN_API_BASE}/{chart_name}?timespan={timespan}&format=csv
-
-    Parameters
-    ----------
-    chart_name : str
-        e.g. 'market-price', 'transaction-fees'.
-    timespan : str
-        Time window. 'all' for full history.
-    use_cache : bool
-        If True, save/load from CACHE_DIR to avoid re-hitting the API.
-
-    Returns
-    -------
-    DataFrame with DatetimeIndex and one column named `chart_name`.
+    Returns a DataFrame with DatetimeIndex and one column named `chart_name`.
     """
-    # 1. Load from cache if available
-    if use_cache and os.path.exists(CACHE_DIR):
-        df = pd.read_csv(CACHE_DIR, index_col='date', parse_dates=['date'])
-        return df
+    cache_path = os.path.join(CACHE_DIR, f'{chart_name}.csv')
+
+    # 1. Load from cache if the FILE exists
+    if use_cache and os.path.exists(cache_path):
+        return pd.read_csv(cache_path, index_col='date', parse_dates=['date'])
 
     # 2. Fetch from the API
     url = f'{BLOCKCHAIN_API_BASE}/{chart_name}'
-    params = {'timespan': timespan, 'format': 'csv'}
+    params = {'timespan': timespan, 'format': 'csv', 'sampled': 'false'}
     response = requests.get(url, params=params, timeout=30)
-    response.raise_for_status()   # raises if the request failed (4xx/5xx)
+    response.raise_for_status()
 
     # 3. Parse — the CSV has NO header, just timestamp,value rows
     df = pd.read_csv(
-        StringIO(response.text),
-        header=None,
-        names=['date', chart_name],
-        parse_dates=['date'],
+    StringIO(response.text),
+    header=None,
+    names=['date', chart_name],
+    parse_dates=['date'],
     )
     df = df.set_index('date')
+    df = df.resample('D').mean().ffill()
 
-    # 4. Save to cache
+    # 4. Save to cache — directory in makedirs, FILE in to_csv
     if use_cache:
         os.makedirs(CACHE_DIR, exist_ok=True)
-        df.to_csv(CACHE_DIR)
+        df.to_csv(cache_path)
 
     # 5. Return
     return df
-
 
 def fetch_all_blockchain_charts(charts: Optional[dict] = None,
                                  use_cache: bool = True) -> pd.DataFrame:
