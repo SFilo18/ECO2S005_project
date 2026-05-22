@@ -1,0 +1,28 @@
+\begin{table}[!htbp] \centering
+\begin{tabular}{@{\extracolsep{5pt}}lccc}
+\\[-1.8ex]\hline
+\hline \\[-1.8ex]
+& \multicolumn{3}{c}{\textit{Dependent variable: d_log_fees_btc}} \
+\cr \cline{2-4}
+\\[-1.8ex] & \multicolumn{1}{c}{Price only} & \multicolumn{1}{c}{+Mempool} & \multicolumn{1}{c}{Full}  \\
+\\[-1.8ex] & (1) & (2) & (3) \\
+\hline \\[-1.8ex]
+ Intercept & -0.001$^{}$ & -0.001$^{}$ & -0.001$^{}$ \\
+& (0.003) & (0.002) & (0.002) \\
+ d_log_mempool_bytes & & 0.197$^{***}$ & 0.176$^{***}$ \\
+& & (0.008) & (0.008) \\
+ d_log_n_transactions & & & 0.580$^{***}$ \\
+& & & (0.055) \\
+ d_log_price_usd & 0.433$^{***}$ & 0.365$^{***}$ & 0.282$^{**}$ \\
+& (0.149) & (0.123) & (0.122) \\
+\hline \\[-1.8ex]
+ Observations & 3627 & 3627 & 3627 \\
+ $R^2$ & 0.003 & 0.228 & 0.325 \\
+ Adjusted $R^2$ & 0.003 & 0.228 & 0.324 \\
+ Residual Std. Error & 0.268 (df=3625) & 0.236 (df=3624) & 0.221 (df=3623) \\
+ F Statistic & 8.468$^{***}$ (df=1; 3625) & 311.919$^{***}$ (df=2; 3624) & 302.466$^{***}$ (df=3; 3623) \\
+\hline
+\hline \\[-1.8ex]
+\textit{Note:} & \multicolumn{3}{r}{$^{*}$p$<$0.1; $^{**}$p$<$0.05; $^{***}$p$<$0.01} \\
+\end{tabular}
+\end{table}
